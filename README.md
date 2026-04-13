@@ -3,6 +3,26 @@
 
 ---
 
+## ⚡ Local Setup (Avoid CORS)
+
+The live GitHub Pages build fetches CSV data from an external endpoint. Running locally via the Vite dev server bypasses browser CORS restrictions and lets you work with the data directly.
+
+```bash
+npm install        # install dependencies
+npm run dev        # start local dev server → http://localhost:5173
+```
+
+To build and preview the production bundle locally:
+
+```bash
+npm run build      # compile to /dist
+npm run preview    # serve /dist → http://localhost:4173
+```
+
+> **Why this matters:** Browsers block cross-origin requests from `file://` or mismatched origins. The Vite dev/preview server proxies requests correctly, so the pipeline data loads without CORS errors.
+
+---
+
 ## 1. What This Is (Modular System Overview)
 
 This application is a **modular, configurable threat mitigation pipeline** that simulates how CHEQ protects Go-to-Market systems from invalid traffic (IVT), bot activity, and fraudulent interactions.
