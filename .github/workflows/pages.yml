@@ -45,16 +45,14 @@ jobs:
 
       - name: Configure GitHub Pages source
         run: |
-          curl -s -o response.json -w "%{http_code}" -X PUT \
+          status=$(curl -s -o response.json -w "%{http_code}" -X PUT \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${{ github.repository }}/pages" \
-            -d '{"build_type":"legacy","source":{"branch":"gh-pages","path":"/"}}' \
-          | tee http_status.txt
-          cat response.json || true
-          status=$(cat http_status.txt)
-          # 200 = updated, 204 = no content (already set), 409 = conflict (retry later)
+            -d '{"build_type":"legacy","source":{"branch":"gh-pages","path":"/"}}')
+          if [ -s response.json ]; then cat response.json; fi
+          # 200 = updated, 204 = no content (already set correctly)
           if [ "$status" = "200" ] || [ "$status" = "204" ]; then
             echo "Pages source configured successfully (HTTP $status)"
           else
