@@ -20,7 +20,7 @@ import {
  * These values can be tuned via the 'Config' tab in the UI.
  */
 var DEFAULT_CONFIG = {
-  dataUrl: "/api/cheq-csv",
+  dataUrl: import.meta.env.DEV ? "/api/cheq-csv" : import.meta.env.BASE_URL.replace(/\/?$/, '/') + "cheq-data.csv",
   cpc: 5.0,
   botThreshold: 80,
   velocityLimit: 10,
