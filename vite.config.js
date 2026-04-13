@@ -49,5 +49,6 @@ export default defineConfig({
       },
     },
   ],
-  base: '/cheq-pipeline/',
+  // GitHub Pages repo path (https://camerensmith.github.io/casestudycheq/)
+  base: '/casestudycheq/',
 })
