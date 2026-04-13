@@ -20,7 +20,8 @@ import {
  * These values can be tuned via the 'Config' tab in the UI.
  */
 var DEFAULT_CONFIG = {
-  dataUrl: import.meta.env.DEV ? "/api/cheq-csv" : import.meta.env.BASE_URL.replace(/\/?$/, '/') + "cheq-data.csv",
+  apiUrl: import.meta.env.DEV ? "/api/cheq-csv" : "https://cheq.free.nf/sample-traffic-data.csv",
+  dataUrl: import.meta.env.BASE_URL.replace(/\/?$/, '/') + "cheq-data.csv",
   sessionLimit: 500,
   cpc: 5.0,
   botThreshold: 80,
@@ -763,6 +764,7 @@ export default function App() {
   var [sessions, setSessions] = useState(null);
   var [stats, setStats] = useState(null);
   var [errorMsg, setErrorMsg] = useState("");
+  var [activeSourceUrl, setActiveSourceUrl] = useState("");
 
   // --- UI NAVIGATION STATE ---
   // Controls which view (Pipeline, Config, Dashboard, Email) is currently active.
@@ -805,7 +807,7 @@ export default function App() {
     if (!stats || !stats.blockedIPs) return;
     var payload = {
       generated_at: new Date().toISOString(),
-      source: config.dataUrl,
+      source: activeSourceUrl || config.dataUrl,
       blocked_ips: stats.blockedIPs.map(function(item) { return item.ip; }),
       blocked_entries: stats.blockedIPs,
     };
@@ -832,7 +834,7 @@ export default function App() {
     if (!sessions || sessions.length === 0) return;
     var payload = {
       generated_at: new Date().toISOString(),
-      source: config.dataUrl,
+      source: activeSourceUrl || config.dataUrl,
       total_sessions: sessions.length,
       sessions: sessions.map(function(s) {
         return {
@@ -879,7 +881,7 @@ export default function App() {
     });
     return {
       generated_at: new Date().toISOString(),
-      source: config.dataUrl,
+      source: activeSourceUrl || config.dataUrl,
       timeframe: String(windowLabels[savingsWindow] || "Weekly") + (isProjectedWindow ? " (Projected)" : ""),
       key_metrics: keyMetrics,
       key_metric_rows: selectedMetrics,
@@ -995,19 +997,37 @@ export default function App() {
       + (Math.max(1, Math.floor(Number(config.sessionLimit) || 500))) + " sessions",
       "info"
     );
-    addLog("Fetching from " + config.dataUrl, "info");
+    addLog("Fetching from API: " + config.apiUrl, "info");
 
-    // Stage 0: FETCH
-    fetch(config.dataUrl)
+    // Stage 0: FETCH — try API first, fall back to CSV
+    var fetchCsv = fetch(config.apiUrl)
       .then(function(response) {
         if (!response.ok) throw new Error("HTTP " + response.status);
-        addLog("HTTP " + response.status + " \u2014 downloading CSV...", "info");
         return response.text();
       })
+      .then(function(text) {
+        if (!text || text.trim().charAt(0) === "<") throw new Error("API returned non-CSV content");
+        addLog("API fetch succeeded (\u2713)", "success");
+        setActiveSourceUrl(config.apiUrl);
+        return text;
+      })
+      .catch(function(apiErr) {
+        addLog("API unavailable (" + apiErr.message + ") \u2014 falling back to CSV: " + config.dataUrl, "warn");
+        return fetch(config.dataUrl)
+          .then(function(response) {
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            return response.text();
+          })
+          .then(function(text) {
+            if (!text || text.trim().charAt(0) === "<") throw new Error("CSV fallback returned non-CSV content");
+            addLog("CSV fallback fetch succeeded (\u2713)", "success");
+            setActiveSourceUrl(config.dataUrl);
+            return text;
+          });
+      });
+
+    fetchCsv
       .then(function(csvText) {
-        if (!csvText || csvText.trim().charAt(0) === "<") {
-          throw new Error("CHEQ endpoint returned non-CSV content");
-        }
         addLog("Received " + csvText.length.toLocaleString() + " bytes", "success");
 
         // Stage 1: PARSE - structured data creation
@@ -1064,7 +1084,7 @@ export default function App() {
                 run_id: "run-" + Date.now(),
                 run_started_at: runStartedAtRef.current || runEndedAt,
                 run_ended_at: runEndedAt,
-                source_url: config.dataUrl,
+                source_url: activeSourceUrl || config.dataUrl,
                 metrics: {
                   total: result.total,
                   valid: result.valid,
@@ -1481,6 +1501,19 @@ export default function App() {
                   {/* Data URL */}
                   <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 24px", border: "1px solid rgba(255,255,255,.04)" }}>
                     <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Data Source</div>
+                    <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>API URL (primary)</div>
+                    <input type="text" value={config.apiUrl}
+                      onChange={function(e) {
+                        var val = e.target.value;
+                        setConfig(function(prev) { var next = JSON.parse(JSON.stringify(prev)); next.apiUrl = val; return next; });
+                      }}
+                      style={{
+                        width: "100%", padding: "9px 12px", borderRadius: 8,
+                        border: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.03)",
+                        color: "#e2e8f0", fontSize: 12, fontFamily: "monospace", outline: "none",
+                        marginBottom: 10,
+                      }} />
+                    <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>CSV Fallback URL</div>
                     <input type="text" value={config.dataUrl}
                       onChange={function(e) {
                         var val = e.target.value;
