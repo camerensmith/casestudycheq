@@ -1,3 +1,13 @@
+/**
+ * CHEQ Threat Mitigation Pipeline - Frontend Application
+ * 
+ * This application demonstrates a real-time threat detection pipeline that:
+ * 1. Fetches raw traffic data (CSV) from a live endpoint.
+ * 2. Parses and cleans the data for processing.
+ * 3. Runs a multi-rule detection engine to identify bots and suspicious activity.
+ * 4. Calculates the financial impact (ROI) and generates remediation reports.
+ */
+
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   PieChart, Pie, Cell, Tooltip as RTooltip,
@@ -5,8 +15,10 @@ import {
   ResponsiveContainer, AreaChart, Area
 } from "recharts";
 
-// ─── DEFAULT PIPELINE CONFIGURATION ─────────────────────────────
-// This config drives the entire pipeline. Edit here or via the UI.
+/**
+ * DEFAULT_CONFIG: The baseline settings for the detection engine.
+ * These values can be tuned via the 'Config' tab in the UI.
+ */
 var DEFAULT_CONFIG = {
   dataUrl: "/api/cheq-csv",
   cpc: 5.0,
@@ -16,16 +28,54 @@ var DEFAULT_CONFIG = {
   blockedCountries: ["China", "Russia"],
   botUserAgents: ["bot", "crawl", "spider", "scrapy", "python-requests", "curl", "wget", "httpclient", "libwww", "java/"],
   scores: { velocity: 45, impossible: 50, botUA: 45, geofence: 40 },
+  pricing: {
+    activeTier: "smb",
+    tiers: {
+      smb: 16092,
+      enterprise: 61032,
+    },
+  },
 };
 
+var AUDIT_STORAGE_KEY = "cheq_audit_trail_v1";
+var BLOCKLIST_STORAGE_KEY = "cheq_blocked_ips_v1";
+
+function simpleHash(input) {
+  var hash = 0;
+  for (var i = 0; i < input.length; i++) {
+    hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function downloadTextFile(filename, text, mimeType) {
+  var blob = new Blob([text], { type: mimeType || "text/plain;charset=utf-8" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * buildUARegex: Generates a case-insensitive regular expression from a list of patterns.
+ * This is used to match user agents against known bot/crawler signatures.
+ */
 function buildUARegex(patterns) {
   if (!patterns || patterns.length === 0) return /^$/;
   var escaped = patterns.map(function(p) { return p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); });
   return new RegExp(escaped.join("|"), "i");
 }
 
-// ─── PIPELINE ENGINE (runs in browser) ──────────────────────────
+// ─── PIPELINE ENGINE ──────────────────────────────────────────
 
+/**
+ * parseCSV: Converts raw CSV text into an array of session objects.
+ * Handles header mapping, type conversion, and timestamp normalization.
+ */
 function parseCSV(text) {
   var lines = text.trim().split("\n");
   if (lines.length < 2) return [];
@@ -53,6 +103,10 @@ function parseCSV(text) {
   return sessions;
 }
 
+/**
+ * findVelocityIPs: Identifies IP addresses exceeding the configured request threshold
+ * within the specified time window (e.g., >10 req/min).
+ */
 function findVelocityIPs(sessions, config) {
   // Group timestamps by IP
   var byIP = {};
@@ -81,6 +135,13 @@ function findVelocityIPs(sessions, config) {
   return flagged;
 }
 
+/**
+ * runDetection: The core rule engine. Evaluates each session against four rules:
+ * 1. Velocity (flood detection)
+ * 2. Impossible behavior (0s page time + form submission)
+ * 3. Bot UA (matches known bot patterns)
+ * 4. Geofence (traffic from blocklisted countries)
+ */
 function runDetection(sessions, config) {
   var velocityIPs = findVelocityIPs(sessions, config);
   var blockedSet = new Set(config.blockedCountries);
@@ -122,6 +183,10 @@ function runDetection(sessions, config) {
   return sessions;
 }
 
+/**
+ * runRemediation: Aggregates the detection results to calculate ROI and reporting stats.
+ * Computes money saved, blocked IPs, and generates timeline data for the charts.
+ */
 function runRemediation(sessions, config) {
   var blocked = {};
   var totalSaved = 0;
@@ -131,6 +196,10 @@ function runRemediation(sessions, config) {
   var suspCount = 0;
   var botCount = 0;
   var cpc = config.cpc;
+  var activeTier = (config.pricing && config.pricing.activeTier) || "smb";
+  var tierMap = (config.pricing && config.pricing.tiers) || { smb: 0, enterprise: 0 };
+  var subscriptionAnnual = Number(tierMap[activeTier] || 0);
+  var dailySubscription = subscriptionAnnual / 365;
 
   sessions.forEach(function(s) {
     if (s.verdict === "Valid") validCount++;
@@ -194,6 +263,11 @@ function runRemediation(sessions, config) {
     s.flags.forEach(function(f) { if (flagCounts[f] !== undefined) flagCounts[f]++; });
   });
 
+  var grossSaved = Math.round(totalSaved * 100) / 100;
+  var netSaved = Math.round((grossSaved - dailySubscription) * 100) / 100;
+  var annualGrossSaved = Math.round(grossSaved * 365 * 100) / 100;
+  var annualNetSaved = Math.round((annualGrossSaved - subscriptionAnnual) * 100) / 100;
+
   return {
     total: sessions.length,
     valid: validCount,
@@ -201,7 +275,13 @@ function runRemediation(sessions, config) {
     bot: botCount,
     blockedIPs: blockedList,
     blockedCount: blockedList.length,
-    saved: Math.round(totalSaved * 100) / 100,
+    saved: netSaved,
+    grossSaved: grossSaved,
+    subscriptionAnnual: subscriptionAnnual,
+    subscriptionDaily: dailySubscription,
+    pricingTier: activeTier,
+    annualGrossSaved: annualGrossSaved,
+    annualNetSaved: annualNetSaved,
     botClicks: botClicks,
     formsBlocked: formsBlocked,
     cpc: cpc,
@@ -219,7 +299,11 @@ function runRemediation(sessions, config) {
   };
 }
 
-// ─── CONSTANTS ───────────────────────────────────────────────────
+// ─── CONSTANTS & UI MAPPING ─────────────────────────────────────
+
+/**
+ * FLAG_INFO: Human-readable labels, colors, and descriptions for each detection rule.
+ */
 var FLAG_INFO = {
   velocity: { label: "Velocity Spike", color: "#f97316", desc: ">10 requests from same IP within 60s" },
   bot_ua: { label: "Bot User Agent", color: "#a855f7", desc: "UA matches known bot/crawler pattern" },
@@ -227,6 +311,9 @@ var FLAG_INFO = {
   geofenced: { label: "Geo-Blocked", color: "#06b6d4", desc: "Traffic from blocklisted country (CN/RU)" },
 };
 
+/**
+ * COUNTRY_EMOJI: Mapping for visual representation of countries in the UI.
+ */
 var COUNTRY_EMOJI = {
   "United States": "\uD83C\uDDFA\uD83C\uDDF8", "United Kingdom": "\uD83C\uDDEC\uD83C\uDDE7",
   Germany: "\uD83C\uDDE9\uD83C\uDDEA", Canada: "\uD83C\uDDE8\uD83C\uDDE6",
@@ -236,6 +323,9 @@ var COUNTRY_EMOJI = {
   Japan: "\uD83C\uDDEF\uD83C\uDDF5",
 };
 
+/**
+ * GEO: Approximate lat/lng coordinates for threat map visualization.
+ */
 var GEO = {
   "United States": [39.8, -98.6], "United Kingdom": [54.0, -2.0],
   Germany: [51.2, 10.4], Canada: [56.1, -106.3], Australia: [-25.3, 133.8],
@@ -243,14 +333,21 @@ var GEO = {
   Russia: [61.5, 105.3], France: [46.6, 2.2], Japan: [36.2, 138.3],
 };
 
+/**
+ * getVC: Helper to return the color associated with a specific detection verdict.
+ */
 function getVC(v) {
   if (v === "Bot") return "#ef4444";
   if (v === "Suspicious") return "#f59e0b";
   return "#10b981";
 }
 
-// ─── COMPONENTS ──────────────────────────────────────────────────
+// ─── SUB-COMPONENTS ──────────────────────────────────────────────
 
+/**
+ * AnimNum: A simple utility component that animates a numeric value from 0 to 'value'.
+ * Uses requestAnimationFrame for smooth performance.
+ */
 function AnimNum({ value, prefix, delay }) {
   var pfx = prefix || "";
   var dl = delay || 0;
@@ -289,7 +386,10 @@ function AnimNum({ value, prefix, delay }) {
   return pfx + display.toLocaleString();
 }
 
-// Pipeline stage visualization
+/**
+ * PipelineViz: Renders a horizontal progress bar showing the 4 stages of the pipeline.
+ * Animates opacity and borders based on the current active stage.
+ */
 var STAGES = [
   { key: "fetch", label: "FETCH", sub: "HTTP GET CSV" },
   { key: "parse", label: "PARSE", sub: "Type conversion" },
@@ -339,7 +439,10 @@ function PipelineViz({ stageIdx, running }) {
   );
 }
 
-// Log feed
+/**
+ * LogFeed: A scrollable console-like component that displays real-time logs from the pipeline.
+ * Color-codes messages by level (info, warn, error, success).
+ */
 function LogFeed({ logs }) {
   var ref = useRef(null);
   var LEVEL_COLORS = { info: "#94a3b8", warn: "#f59e0b", error: "#ef4444", success: "#10b981" };
@@ -368,6 +471,10 @@ function LogFeed({ logs }) {
 }
 
 // World map
+/**
+ * WorldMap: An SVG-based visualization that plots threat origins on a global map.
+ * Draws lines from flagged countries to the 'TechCorp HQ' (US) to show attack vectors.
+ */
 function WorldMap({ threats }) {
   if (!threats || threats.length === 0) return null;
   var countries = {};
@@ -426,6 +533,10 @@ function WorldMap({ threats }) {
 }
 
 // Rule tuner
+/**
+ * RuleTuner: A "sandbox" component that lets users adjust detection weights and thresholds
+ * on-the-fly to see how they impact the results (Bots caught, money saved, etc).
+ */
 function RuleTuner({ sessions }) {
   var [velW, setVelW] = useState(45);
   var [velT, setVelT] = useState(10);
@@ -499,6 +610,10 @@ function RuleTuner({ sessions }) {
 }
 
 // Threat modal
+/**
+ * ThreatModal: An overlay that provides a deep-dive investigation into a specific session.
+ * Displays risk scores, individual flag triggers, and technical metadata (IP, UA, etc).
+ */
 function ThreatModal({ session, onClose }) {
   if (!session) return null;
   var vc = getVC(session.verdict);
@@ -571,12 +686,16 @@ function ThreatModal({ session, onClose }) {
 }
 
 // Email preview
+/**
+ * EmailPreview: Generates a professional summary email for the CTO.
+ * Uses the pipeline results to populate key metrics (Spend identified, attack vectors, etc).
+ */
 function EmailPreview({ stats }) {
   var [copied, setCopied] = useState(false);
   if (!stats) return null;
   var pct = ((stats.bot + stats.suspicious) / stats.total * 100).toFixed(0);
   var annual = (stats.saved * 365).toLocaleString();
-  var body = "Subject: Traffic Analysis Results \u2014 $" + stats.saved.toLocaleString() + " in Bot Spend Identified\n\nDear CTO,\n\nWe ran your recent traffic (" + stats.total + " sessions) through our automated threat detection pipeline and identified that approximately " + pct + "% of your traffic is either confirmed bot activity or suspicious. In this sample, " + stats.bot + " sessions exceeded our bot threshold, generating " + stats.botClicks + " fraudulent clicks and " + stats.formsBlocked + " fake form submissions \u2014 translating to $" + stats.saved.toLocaleString() + " in wasted ad spend.\n\nThe most common attack vectors were:\n\u2022 Bot user agents (scrapers, crawlers) \u2014 " + stats.flagCounts[0].count + " detections\n\u2022 Geofenced traffic from China & Russia \u2014 " + stats.flagCounts[1].count + " detections\n\u2022 Impossible form submissions (0s page time) \u2014 " + stats.flagCounts[2].count + " detections\n\u2022 Velocity flooding (>10 req/min) \u2014 " + stats.flagCounts[3].count + " detections\n\nAt this rate, your annualized exposure exceeds $" + annual + ". We have compiled a blocklist of " + stats.blockedCount + " offending IPs and can have automated protection running within days.\n\nBest regards,\n[Your Name]\nCustomer Success Engineering, CHEQ";
+  var body = "Subject: Traffic Analysis Results \u2014 $" + stats.saved.toLocaleString() + " in Bot Spend Identified\n\nDear [Informed Party],\n\nI did a quick traffic check (" + stats.total + " sessions) through our automated threat detection pipeline and identified that roughly " + pct + "% of your traffic is either confirmed bot activity or was flagged as suspicious. In this sample, " + stats.bot + " sessions exceeded our bot threshold, generating " + stats.botClicks + " fraudulent clicks and " + stats.formsBlocked + " fake form submissions \u2014 translating to $" + stats.saved.toLocaleString() + " in wasted ad spend.\n\nHere are some of the flags that were triggered:\n\u2022 Bot user agents (scrapers, crawlers) \u2014 " + stats.flagCounts[0].count + " detections\n\u2022 Geofenced traffic from China & Russia \u2014 " + stats.flagCounts[1].count + " detections\n\u2022 Impossible form submissions (0s page time) \u2014 " + stats.flagCounts[2].count + " detections\n\u2022 Velocity flooding (>10 req/min) \u2014 " + stats.flagCounts[3].count + " detections\n\nAt this rate, your annualized exposure exceeds $" + annual + ". We have compiled a blocklist of " + stats.blockedCount + " offending IPs and can have automated protection running within days.\n\nBest regards,\n[Your Name]\nCustomer Success Engineering, CHEQ";
   return (
     <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, border: "1px solid rgba(255,255,255,.04)", overflow: "hidden" }}>
       <div style={{ padding: "16px 22px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,.04)" }}>
@@ -595,31 +714,120 @@ function EmailPreview({ stats }) {
   );
 }
 
-// ─── MAIN APP ────────────────────────────────────────────────────
+// ─── MAIN APP COMPONENT ─────────────────────────────────────────
+
+/**
+ * App: The root component that orchestrates the entire application lifecycle.
+ * Manages pipeline execution, configuration state, and routing between views.
+ */
 export default function App() {
-  // Pipeline config (editable before running)
+  // --- CONFIGURATION STATE ---
+  // Users can tweak these settings before running the pipeline.
   var [config, setConfig] = useState(JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
 
-  // Pipeline state
-  var [pipelineState, setPipelineState] = useState("idle"); // idle | running | done | error
+  // --- PIPELINE EXECUTION STATE ---
+  // Tracks the lifecycle of the data processing (idle -> running -> done).
+  var [pipelineState, setPipelineState] = useState("idle");
   var [stageIdx, setStageIdx] = useState(-1);
   var [logs, setLogs] = useState([]);
   var [sessions, setSessions] = useState(null);
   var [stats, setStats] = useState(null);
   var [errorMsg, setErrorMsg] = useState("");
 
-  // UI state
+  // --- UI NAVIGATION STATE ---
+  // Controls which view (Pipeline, Config, Dashboard, Email) is currently active.
   var [view, setView] = useState("pipeline");
   var [dashTab, setDashTab] = useState("overview");
   var [filter, setFilter] = useState("all");
   var [selectedSession, setSelectedSession] = useState(null);
+  var [auditTrail, setAuditTrail] = useState([]);
+  var [auditFrom, setAuditFrom] = useState("");
+  var [auditTo, setAuditTo] = useState("");
+  var runStartedAtRef = useRef(null);
 
+  useEffect(function() {
+    try {
+      var savedAudit = localStorage.getItem(AUDIT_STORAGE_KEY);
+      if (savedAudit) {
+        var parsed = JSON.parse(savedAudit);
+        if (Array.isArray(parsed)) setAuditTrail(parsed);
+      }
+    } catch (e) {}
+  }, []);
+
+  /**
+   * addLog: Helper to push a new message to the real-time pipeline log.
+   */
   function addLog(msg, level) {
     var time = new Date().toLocaleTimeString("en-US", { hour12: false });
     setLogs(function(prev) { return prev.concat([{ time: time, msg: msg, level: level || "info" }]); });
   }
 
+  function exportBlockedIpsJson() {
+    if (!stats || !stats.blockedIPs) return;
+    var payload = {
+      generated_at: new Date().toISOString(),
+      source: config.dataUrl,
+      blocked_ips: stats.blockedIPs.map(function(item) { return item.ip; }),
+      blocked_entries: stats.blockedIPs,
+    };
+    downloadTextFile("blocked_ips.json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportAuditCsv() {
+    var fromMs = auditFrom ? new Date(auditFrom).getTime() : Number.NEGATIVE_INFINITY;
+    var toMs = auditTo ? new Date(auditTo).getTime() : Number.POSITIVE_INFINITY;
+    var rows = auditTrail.filter(function(entry) {
+      var ts = new Date(entry.run_ended_at).getTime();
+      return ts >= fromMs && ts <= toMs;
+    });
+    if (rows.length === 0) return;
+    var header = [
+      "run_id",
+      "run_started_at",
+      "run_ended_at",
+      "source_url",
+      "total_sessions",
+      "valid_sessions",
+      "suspicious_sessions",
+      "bot_sessions",
+      "blocked_ip_count",
+      "forms_blocked",
+      "bot_clicks",
+      "saved_spend",
+      "prev_hash",
+      "record_hash",
+    ].join(",");
+    var body = rows.map(function(row) {
+      return [
+        row.run_id,
+        row.run_started_at,
+        row.run_ended_at,
+        row.source_url,
+        row.metrics.total,
+        row.metrics.valid,
+        row.metrics.suspicious,
+        row.metrics.bot,
+        row.metrics.blocked_count,
+        row.metrics.forms_blocked,
+        row.metrics.bot_clicks,
+        row.metrics.saved,
+        row.prev_hash || "",
+        row.record_hash,
+      ].join(",");
+    }).join("\n");
+    downloadTextFile("audit_trail_metrics.csv", header + "\n" + body, "text/csv;charset=utf-8");
+  }
+
+  /**
+   * runPipeline: The primary orchestrator for the 4-stage data pipeline.
+   * Stage 0 (FETCH): HTTP request for the CSV data.
+   * Stage 1 (PARSE): Conversion from raw text to structured objects.
+   * Stage 2 (DETECT): Application of the 4-rule threat engine.
+   * Stage 3 (REMEDIATE): ROI calculation and reporting.
+   */
   var runPipeline = useCallback(function() {
+    runStartedAtRef.current = new Date().toISOString();
     setPipelineState("running");
     setLogs([]);
     setStageIdx(0);
@@ -639,13 +847,13 @@ export default function App() {
         }
         addLog("Received " + csvText.length.toLocaleString() + " bytes", "success");
 
-        // Stage 1: PARSE
+        // Stage 1: PARSE - structured data creation
         setStageIdx(1);
         addLog("Parsing CSV \u2014 converting types...", "info");
         var parsed = parseCSV(csvText);
         addLog("Parsed " + parsed.length + " sessions", "success");
 
-        // Stage 2: DETECT
+        // Stage 2: DETECT - risk evaluation
         setTimeout(function() {
           setStageIdx(2);
           addLog("Running detection with config: velocity>" + config.velocityLimit + "req/" + config.velocityWindow + "s, threshold>" + config.botThreshold, "info");
@@ -660,19 +868,71 @@ export default function App() {
           });
           if (bots.length > 5) addLog("... and " + (bots.length - 5) + " more blocked", "error");
 
-          // Stage 3: REMEDIATE
+          // Stage 3: REMEDIATE - financial impact assessment
           setTimeout(function() {
             setStageIdx(3);
             addLog("Running remediation \u2014 blocking IPs, calculating ROI...", "info");
             var result = runRemediation(detected, config);
 
             addLog("Blocked " + result.blockedCount + " unique IPs", "info");
-            addLog("Saved: $" + result.saved.toLocaleString() + " (" + result.botClicks + " clicks x $" + config.cpc + " CPC)", "success");
+            addLog(
+              "Saved (net): $" + result.saved.toLocaleString()
+              + " [gross $" + result.grossSaved.toLocaleString()
+              + " - daily " + String(result.pricingTier || "smb").toUpperCase()
+              + " subscription $" + result.subscriptionDaily.toFixed(2) + "]",
+              "success"
+            );
             addLog(result.formsBlocked + " fake form submissions intercepted", "success");
             addLog("Pipeline complete \u2713 \u2014 all data processed from live endpoint", "success");
 
             setSessions(detected);
             setStats(result);
+
+            var runEndedAt = new Date().toISOString();
+            setAuditTrail(function(prev) {
+              var prevHash = prev.length > 0 ? prev[prev.length - 1].record_hash : "";
+              var baseRecord = {
+                run_id: "run-" + Date.now(),
+                run_started_at: runStartedAtRef.current || runEndedAt,
+                run_ended_at: runEndedAt,
+                source_url: config.dataUrl,
+                metrics: {
+                  total: result.total,
+                  valid: result.valid,
+                  suspicious: result.suspicious,
+                  bot: result.bot,
+                  blocked_count: result.blockedCount,
+                  forms_blocked: result.formsBlocked,
+                  bot_clicks: result.botClicks,
+                  saved: result.saved,
+                },
+                blocked_ips: result.blockedIPs.map(function(item) { return item.ip; }),
+                prev_hash: prevHash,
+              };
+              var recordHash = simpleHash(JSON.stringify(baseRecord));
+              var fullRecord = Object.assign({}, baseRecord, { record_hash: recordHash });
+              var next = prev.concat([fullRecord]);
+              try {
+                localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(next));
+              } catch (e) {}
+              return next;
+            });
+
+            try {
+              var existing = localStorage.getItem(BLOCKLIST_STORAGE_KEY);
+              var parsed = existing ? JSON.parse(existing) : [];
+              var now = new Date().toISOString();
+              result.blockedIPs.forEach(function(item) {
+                parsed.push({
+                  ip: item.ip,
+                  detected_at: now,
+                  flags: item.flags,
+                  country: item.country,
+                  saved: item.saved,
+                });
+              });
+              localStorage.setItem(BLOCKLIST_STORAGE_KEY, JSON.stringify(parsed));
+            } catch (e) {}
 
             setTimeout(function() {
               setPipelineState("done");
@@ -688,12 +948,14 @@ export default function App() {
       });
   }, [config]);
 
+  // filteredSessions: Memoized list of sessions based on the UI filter (All/Bot/Suspicious/Valid)
   var filteredSessions = useMemo(function() {
     if (!sessions) return [];
     if (filter === "all") return sessions;
     return sessions.filter(function(s) { return s.verdict.toLowerCase() === filter; });
   }, [sessions, filter]);
 
+  // pieData: Memoized data for the traffic breakdown chart
   var pieData = stats ? [
     { name: "Valid", value: stats.valid },
     { name: "Suspicious", value: stats.suspicious },
@@ -701,6 +963,13 @@ export default function App() {
   ] : [];
   var PIE_COLORS = ["#10b981", "#f59e0b", "#ef4444"];
   var ttStyle = { background: "#151d30", border: "1px solid rgba(255,255,255,.08)", borderRadius: 8, fontSize: 12, color: "#e2e8f0" };
+  var moneySavedTooltip = stats
+    ? "Net saved = Gross saved - daily subscription cost\n"
+      + "Gross: $" + stats.grossSaved.toLocaleString()
+      + " | Tier: " + String(stats.pricingTier || "smb").toUpperCase()
+      + " | Daily sub: $" + (stats.subscriptionDaily || 0).toFixed(2)
+      + "\nAnnual net = $" + (stats.annualNetSaved || 0).toLocaleString()
+    : "";
 
   return (
     <div>
@@ -712,7 +981,9 @@ export default function App() {
       `}</style>
       <div style={{ fontFamily: "system-ui, sans-serif", background: "#070b16", minHeight: "100vh", color: "#e2e8f0" }}>
 
-        {/* HEADER */}
+        {/* --- HEADER ---
+            Global navigation for the pipeline application.
+        */}
         <div style={{ background: "linear-gradient(180deg,#0d1424,#070b16)", borderBottom: "1px solid rgba(255,255,255,.04)", padding: "14px 24px", position: "sticky", top: 0, zIndex: 50 }}>
           <div style={{ maxWidth: 1200, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -738,7 +1009,9 @@ export default function App() {
 
         <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 24px 64px" }}>
 
-          {/* PIPELINE */}
+          {/* --- PIPELINE VIEW ---
+              The core entry point where users run the live data fetch and process.
+          */}
           {view === "pipeline" && (
             <div style={{ animation: "fadeIn .4s" }}>
               <div style={{ textAlign: "center", marginBottom: 44 }}>
@@ -781,10 +1054,10 @@ export default function App() {
                     { l: "Sessions", v: stats.total, c: "#6366f1" },
                     { l: "Threats", v: stats.bot, c: "#ef4444" },
                     { l: "IPs Blocked", v: stats.blockedCount, c: "#f97316" },
-                    { l: "Money Saved", v: stats.saved, p: "$", c: "#10b981" },
+                    { l: "Money Saved", v: stats.saved, p: "$", c: "#10b981", tip: moneySavedTooltip },
                   ].map(function(item, i) {
                     return (
-                      <div key={item.l} style={{ background: item.c + "08", borderRadius: 14, padding: "20px 18px", border: "1px solid " + item.c + "18", textAlign: "center" }}>
+                      <div key={item.l} title={item.tip || ""} style={{ background: item.c + "08", borderRadius: 14, padding: "20px 18px", border: "1px solid " + item.c + "18", textAlign: "center" }}>
                         <div style={{ fontSize: 30, fontWeight: 800, color: item.c, letterSpacing: -1.5 }}>
                           <AnimNum value={item.v} prefix={item.p} delay={i * 200} />
                         </div>
@@ -797,7 +1070,9 @@ export default function App() {
             </div>
           )}
 
-          {/* CONFIG EDITOR */}
+          {/* --- CONFIG VIEW ---
+              Allows tuning of thresholds and detection patterns.
+          */}
           {view === "config" && (
             <div style={{ animation: "fadeIn .4s", maxWidth: 800, margin: "0 auto" }}>
               <div style={{ marginBottom: 28 }}>
@@ -1000,6 +1275,77 @@ export default function App() {
                         color: "#e2e8f0", fontSize: 12, fontFamily: "monospace", outline: "none",
                       }} />
                   </div>
+
+                  {/* Pricing Tiers */}
+                  <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 24px", border: "1px solid rgba(255,255,255,.04)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Subscription Pricing</div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10 }}>Net savings = gross savings - subscription cost</div>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                      {[
+                        ["smb", "SMB"],
+                        ["enterprise", "Enterprise"],
+                      ].map(function(tier) {
+                        return (
+                          <button
+                            key={tier[0]}
+                            onClick={function() {
+                              setConfig(function(prev) {
+                                var next = JSON.parse(JSON.stringify(prev));
+                                next.pricing.activeTier = tier[0];
+                                return next;
+                              });
+                            }}
+                            style={{
+                              padding: "6px 12px",
+                              borderRadius: 8,
+                              border: "none",
+                              cursor: "pointer",
+                              fontSize: 11,
+                              fontWeight: 600,
+                              background: config.pricing.activeTier === tier[0] ? "rgba(16,185,129,.2)" : "rgba(255,255,255,.05)",
+                              color: config.pricing.activeTier === tier[0] ? "#6ee7b7" : "#94a3b8",
+                            }}
+                          >
+                            {tier[1]}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <div>
+                        <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>SMB annual ($)</div>
+                        <input
+                          type="number"
+                          value={config.pricing.tiers.smb}
+                          onChange={function(e) {
+                            var val = Number(e.target.value) || 0;
+                            setConfig(function(prev) {
+                              var next = JSON.parse(JSON.stringify(prev));
+                              next.pricing.tiers.smb = val;
+                              return next;
+                            });
+                          }}
+                          style={{ width: "100%", padding: "7px 10px", borderRadius: 8, border: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.03)", color: "#e2e8f0", fontSize: 12, outline: "none" }}
+                        />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>Enterprise annual ($)</div>
+                        <input
+                          type="number"
+                          value={config.pricing.tiers.enterprise}
+                          onChange={function(e) {
+                            var val = Number(e.target.value) || 0;
+                            setConfig(function(prev) {
+                              var next = JSON.parse(JSON.stringify(prev));
+                              next.pricing.tiers.enterprise = val;
+                              return next;
+                            });
+                          }}
+                          style={{ width: "100%", padding: "7px 10px", borderRadius: 8, border: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.03)", color: "#e2e8f0", fontSize: 12, outline: "none" }}
+                        />
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1056,12 +1402,19 @@ export default function App() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 20 }}>
                 {[
                   { l: "SESSIONS", v: stats.total, c: "#6366f1", s: "from live endpoint" },
-                  { l: "MONEY SAVED", v: stats.saved, p: "$", c: "#10b981", s: stats.botClicks + " clicks x $" + (stats?.cpc || 5) },
+                  {
+                    l: "MONEY SAVED",
+                    v: stats.saved,
+                    p: "$",
+                    c: "#10b981",
+                    s: "Gross $" + stats.grossSaved.toLocaleString() + " - " + String(stats.pricingTier || "smb").toUpperCase() + " $" + (stats.subscriptionDaily || 0).toFixed(2) + "/day",
+                    tip: moneySavedTooltip,
+                  },
                   { l: "IPS BLOCKED", v: stats.blockedCount, c: "#ef4444", s: "written to blocklist" },
                   { l: "FORMS BLOCKED", v: stats.formsBlocked, c: "#f59e0b", s: "conversions protected" },
                 ].map(function(kpi, i) {
                   return (
-                    <div key={kpi.l} style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 20px", border: "1px solid rgba(255,255,255,.04)" }}>
+                    <div key={kpi.l} title={kpi.tip || ""} style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 20px", border: "1px solid rgba(255,255,255,.04)" }}>
                       <div style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 }}>{kpi.l}</div>
                       <div style={{ fontSize: 34, fontWeight: 800, color: kpi.c, letterSpacing: -2 }}>
                         <AnimNum value={kpi.v} prefix={kpi.p} delay={i * 150} />
@@ -1207,11 +1560,13 @@ export default function App() {
               {/* ROI */}
               <div style={{ marginTop: 20, borderRadius: 16, padding: "26px 30px", background: "linear-gradient(135deg,rgba(16,185,129,.06),rgba(6,182,212,.04))", border: "1px solid rgba(16,185,129,.1)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 20 }}>
                 <div>
-                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>PROJECTED ANNUAL SAVINGS</div>
+                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>PROJECTED ANNUAL NET SAVINGS</div>
                   <div style={{ fontSize: 40, fontWeight: 800, color: "#10b981", letterSpacing: -2.5 }}>
-                    <AnimNum value={Math.round(stats.saved * 365)} prefix="$" delay={300} />
+                    <AnimNum value={Math.round(stats.annualNetSaved || 0)} prefix="$" delay={300} />
                   </div>
-                  <div style={{ fontSize: 11, color: "#334155", marginTop: 3 }}>Based on current sample detection rate</div>
+                  <div style={{ fontSize: 11, color: "#334155", marginTop: 3 }}>
+                    Annual gross ${Math.round(stats.annualGrossSaved || 0).toLocaleString()} - {String(stats.pricingTier || "smb").toUpperCase()} ${Math.round(stats.subscriptionAnnual || 0).toLocaleString()}
+                  </div>
                 </div>
                 <div style={{ display: "flex", gap: 32 }}>
                   {[
