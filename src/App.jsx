@@ -1000,7 +1000,7 @@ export default function App() {
     addLog("Fetching from API: " + config.apiUrl, "info");
 
     // Stage 0: FETCH — try API first, fall back to CSV
-    var fetchCsv = fetch(config.apiUrl)
+    var fetchData = fetch(config.apiUrl)
       .then(function(response) {
         if (!response.ok) throw new Error("HTTP " + response.status);
         return response.text();
@@ -1026,7 +1026,7 @@ export default function App() {
           });
       });
 
-    fetchCsv
+    fetchData
       .then(function(csvText) {
         addLog("Received " + csvText.length.toLocaleString() + " bytes", "success");
 
