@@ -1831,11 +1831,13 @@ export default function App() {
               {/* Sub-tabs */}
               <div style={{ display: "flex", gap: 3, marginBottom: 16, background: "rgba(255,255,255,.02)", borderRadius: 10, padding: 3, width: "fit-content" }}>
                 {[["overview","Overview"],["map","Threat Map"],["tuning","Rule Tuning"],["sessions","Sessions"]].map(function(pair) {
+                  var isTuning = pair[0] === "tuning";
                   return (
-                    <button key={pair[0]} onClick={function() { setDashTab(pair[0]); }} style={{
-                      padding: "6px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 600,
+                    <button key={pair[0]} onClick={isTuning ? undefined : function() { setDashTab(pair[0]); }} title={isTuning ? "Feature not available yet!" : undefined} disabled={isTuning} style={{
+                      padding: "6px 16px", borderRadius: 8, border: "none", cursor: isTuning ? "not-allowed" : "pointer", fontSize: 11, fontWeight: 600,
                       background: dashTab === pair[0] ? "rgba(255,255,255,.08)" : "transparent",
-                      color: dashTab === pair[0] ? "#f1f5f9" : "#475569",
+                      color: isTuning ? "#2d3f55" : (dashTab === pair[0] ? "#f1f5f9" : "#475569"),
+                      opacity: isTuning ? 0.5 : 1,
                     }}>{pair[1]}</button>
                   );
                 })}
