@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { createDecipheriv } from 'node:crypto'
+import { writeFileSync, mkdirSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 function solveChallengeCookie(html) {
   const match = html.match(/a=toNumbers\("([0-9a-f]+)"\),b=toNumbers\("([0-9a-f]+)"\),c=toNumbers\("([0-9a-f]+)"\)/i)
@@ -46,6 +48,33 @@ export default defineConfig({
             res.end(`Proxy fetch failed: ${err.message}`)
           }
         })
+      },
+      async buildStart() {
+        // Pre-fetch the CSV at build time so the production static bundle
+        // can serve it without the Vite dev-server middleware.
+        const dest = resolve(__dirname, 'public/cheq-data.csv')
+        try {
+          const baseUrl = 'https://cheq.free.nf/sample-traffic-data.csv'
+          const first = await fetch(baseUrl)
+          const firstText = await first.text()
+          const cookie = solveChallengeCookie(firstText)
+
+          const second = await fetch(`${baseUrl}?i=1`, {
+            headers: cookie ? { cookie: `__test=${cookie}` } : {},
+          })
+          const secondText = await second.text()
+
+          if (!second.ok || secondText.trim().startsWith('<')) {
+            console.warn('[cheq-challenge-bypass] Build: upstream returned non-CSV; skipping cheq-data.csv')
+            return
+          }
+
+          mkdirSync(resolve(__dirname, 'public'), { recursive: true })
+          writeFileSync(dest, secondText, 'utf-8')
+          console.log(`[cheq-challenge-bypass] Wrote ${secondText.length} bytes to public/cheq-data.csv`)
+        } catch (err) {
+          console.warn(`[cheq-challenge-bypass] Build: could not pre-fetch CSV — ${err.message}`)
+        }
       },
     },
   ],

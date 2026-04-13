@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Pre-fetched at build time; not committed to source control
+public/cheq-data.csv
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
