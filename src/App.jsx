@@ -738,6 +738,7 @@ export default function App() {
   // Controls which view (Pipeline, Config, Dashboard, Email) is currently active.
   var [view, setView] = useState("pipeline");
   var [dashTab, setDashTab] = useState("overview");
+  var [savingsWindow, setSavingsWindow] = useState("annual");
   var [filter, setFilter] = useState("all");
   var [selectedSession, setSelectedSession] = useState(null);
   var [auditTrail, setAuditTrail] = useState([]);
@@ -963,12 +964,18 @@ export default function App() {
   ] : [];
   var PIE_COLORS = ["#10b981", "#f59e0b", "#ef4444"];
   var ttStyle = { background: "#151d30", border: "1px solid rgba(255,255,255,.08)", borderRadius: 8, fontSize: 12, color: "#e2e8f0" };
+  var windowMultipliers = { daily: 1, weekly: 7, monthly: 30, annual: 365 };
+  var windowLabels = { daily: "Daily", weekly: "Weekly", monthly: "Monthly", annual: "Annual" };
+  var selectedMultiplier = windowMultipliers[savingsWindow] || 365;
+  var scaledNetSaved = stats ? Math.round((stats.saved || 0) * selectedMultiplier * 100) / 100 : 0;
+  var scaledGrossSaved = stats ? Math.round((stats.grossSaved || 0) * selectedMultiplier * 100) / 100 : 0;
+  var scaledSubscription = stats ? Math.round((stats.subscriptionDaily || 0) * selectedMultiplier * 100) / 100 : 0;
   var moneySavedTooltip = stats
-    ? "Net saved = Gross saved - daily subscription cost\n"
-      + "Gross: $" + stats.grossSaved.toLocaleString()
+    ? windowLabels[savingsWindow] + " net saved = gross saved - subscription cost\n"
+      + "Gross: $" + scaledGrossSaved.toLocaleString()
       + " | Tier: " + String(stats.pricingTier || "smb").toUpperCase()
-      + " | Daily sub: $" + (stats.subscriptionDaily || 0).toFixed(2)
-      + "\nAnnual net = $" + (stats.annualNetSaved || 0).toLocaleString()
+      + " | " + windowLabels[savingsWindow] + " sub: $" + scaledSubscription.toLocaleString()
+      + "\nNet: $" + scaledNetSaved.toLocaleString()
     : "";
 
   return (
@@ -1392,9 +1399,35 @@ export default function App() {
                   <h2 style={{ fontSize: 28, fontWeight: 800, letterSpacing: -1.2, color: "#f1f5f9" }}>TechCorp \u2014 Threat Report</h2>
                   <div style={{ fontSize: 12, color: "#334155", marginTop: 4 }}>{stats.total} sessions analyzed from live endpoint \u00B7 ${stats?.cpc || 5} CPC</div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", background: "rgba(16,185,129,.06)", borderRadius: 10, border: "1px solid rgba(16,185,129,.12)" }}>
-                  <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981" }} />
-                  <span style={{ fontSize: 11, color: "#10b981", fontWeight: 600 }}>Processed from live data</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", background: "rgba(16,185,129,.06)", borderRadius: 10, border: "1px solid rgba(16,185,129,.12)" }}>
+                    <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981" }} />
+                    <span style={{ fontSize: 11, color: "#10b981", fontWeight: 600 }}>Processed from live data</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,.03)", borderRadius: 10, padding: 3 }}>
+                    {["daily", "weekly", "monthly", "annual"].map(function(w) {
+                      var isActive = savingsWindow === w;
+                      return (
+                        <button
+                          key={w}
+                          onClick={function() { setSavingsWindow(w); }}
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 7,
+                            border: "none",
+                            cursor: "pointer",
+                            fontSize: 10,
+                            fontWeight: 700,
+                            background: isActive ? "rgba(16,185,129,.18)" : "transparent",
+                            color: isActive ? "#6ee7b7" : "#64748b",
+                            letterSpacing: 0.4,
+                          }}
+                        >
+                          {windowLabels[w]}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
 
@@ -1404,10 +1437,10 @@ export default function App() {
                   { l: "SESSIONS", v: stats.total, c: "#6366f1", s: "from live endpoint" },
                   {
                     l: "MONEY SAVED",
-                    v: stats.saved,
+                    v: scaledNetSaved,
                     p: "$",
                     c: "#10b981",
-                    s: "Gross $" + stats.grossSaved.toLocaleString() + " - " + String(stats.pricingTier || "smb").toUpperCase() + " $" + (stats.subscriptionDaily || 0).toFixed(2) + "/day",
+                    s: windowLabels[savingsWindow] + " gross $" + scaledGrossSaved.toLocaleString() + " - " + String(stats.pricingTier || "smb").toUpperCase() + " $" + scaledSubscription.toLocaleString(),
                     tip: moneySavedTooltip,
                   },
                   { l: "IPS BLOCKED", v: stats.blockedCount, c: "#ef4444", s: "written to blocklist" },
@@ -1560,12 +1593,12 @@ export default function App() {
               {/* ROI */}
               <div style={{ marginTop: 20, borderRadius: 16, padding: "26px 30px", background: "linear-gradient(135deg,rgba(16,185,129,.06),rgba(6,182,212,.04))", border: "1px solid rgba(16,185,129,.1)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 20 }}>
                 <div>
-                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>PROJECTED ANNUAL NET SAVINGS</div>
+                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>{("PROJECTED " + String(windowLabels[savingsWindow] || "Annual").toUpperCase() + " NET SAVINGS")}</div>
                   <div style={{ fontSize: 40, fontWeight: 800, color: "#10b981", letterSpacing: -2.5 }}>
-                    <AnimNum value={Math.round(stats.annualNetSaved || 0)} prefix="$" delay={300} />
+                    <AnimNum value={Math.round(scaledNetSaved || 0)} prefix="$" delay={300} />
                   </div>
                   <div style={{ fontSize: 11, color: "#334155", marginTop: 3 }}>
-                    Annual gross ${Math.round(stats.annualGrossSaved || 0).toLocaleString()} - {String(stats.pricingTier || "smb").toUpperCase()} ${Math.round(stats.subscriptionAnnual || 0).toLocaleString()}
+                    {windowLabels[savingsWindow]} gross ${Math.round(scaledGrossSaved || 0).toLocaleString()} - {String(stats.pricingTier || "smb").toUpperCase()} ${Math.round(scaledSubscription || 0).toLocaleString()}
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 32 }}>
