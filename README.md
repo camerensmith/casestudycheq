@@ -93,6 +93,15 @@ Each layer is **loosely coupled and replaceable**.
 
 ---
 
+## 🤖 Agent-Friendly Codebase
+
+This project is optimized for AI-assisted development and rapid ingestion by LLM agents.
+
+- **[Quick Reference Guide (agents.md)](./agents.md)**: A structural map of the codebase designed for agents to quickly locate logic, state, and components.
+- **Annotated Source**: `App.jsx` contains comprehensive comment blocks explaining the purpose and data flow of every major section.
+
+---
+
 ## 2. How the Pipeline Is Used
 
 Fetch → Parse → Analyze → Score → Mitigate → Quantify → Visualize  

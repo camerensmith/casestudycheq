@@ -21,6 +21,7 @@ import {
  */
 var DEFAULT_CONFIG = {
   dataUrl: import.meta.env.DEV ? "/api/cheq-csv" : import.meta.env.BASE_URL.replace(/\/?$/, '/') + "cheq-data.csv",
+  sessionLimit: 500,
   cpc: 5.0,
   botThreshold: 80,
   velocityLimit: 10,
@@ -28,6 +29,18 @@ var DEFAULT_CONFIG = {
   blockedCountries: ["China", "Russia"],
   botUserAgents: ["bot", "crawl", "spider", "scrapy", "python-requests", "curl", "wget", "httpclient", "libwww", "java/"],
   scores: { velocity: 45, impossible: 50, botUA: 45, geofence: 40 },
+  autoRun: {
+    enabled: false,
+    intervalMs: 3600000,
+  },
+  reportBuilder: {
+    fields: {
+      total_traffic_analyzed: true,
+      total_money_saved: true,
+      total_blocked_ips: true,
+      conversion_protection: true,
+    },
+  },
   pricing: {
     activeTier: "smb",
     tiers: {
@@ -233,27 +246,43 @@ function runRemediation(sessions, config) {
 
   var blockedList = Object.values(blocked).sort(function(a, b) { return b.saved - a.saved; });
 
-  // Build hourly timeline
-  var hourBuckets = {};
-  for (var h = 0; h < 24; h++) {
-    hourBuckets[h] = { Valid: 0, Suspicious: 0, Bot: 0 };
+  var minTs = Infinity;
+  var maxTs = -Infinity;
+  sessions.forEach(function(s) {
+    if (typeof s.timestamp_ms === "number" && isFinite(s.timestamp_ms)) {
+      if (s.timestamp_ms < minTs) minTs = s.timestamp_ms;
+      if (s.timestamp_ms > maxTs) maxTs = s.timestamp_ms;
+    }
+  });
+  if (!isFinite(minTs) || !isFinite(maxTs)) {
+    minTs = Date.now();
+    maxTs = minTs;
   }
+  var spanMs = Math.max(0, maxTs - minTs);
+  var dataSpanDays = Math.max(1, Math.ceil(spanMs / 86400000));
+
+  // Build timeline as a continuous day-by-day trend around the ingested snapshot.
+  var dayBuckets = {};
   sessions.forEach(function(s) {
     try {
-      var hour = new Date(s.timestamp_raw).getHours();
-      if (!isNaN(hour) && hourBuckets[hour]) {
-        hourBuckets[hour][s.verdict]++;
-      }
+      var dayKey = new Date(s.timestamp_raw).toISOString().slice(0, 10);
+      if (!dayBuckets[dayKey]) dayBuckets[dayKey] = { Valid: 0, Suspicious: 0, Bot: 0 };
+      dayBuckets[dayKey][s.verdict]++;
     } catch (e) {}
   });
   var timeline = [];
-  for (var hr = 0; hr < 24; hr += 2) {
-    var label = String(hr).padStart(2, "0") + ":00";
+  var startDay = new Date(minTs);
+  startDay.setUTCHours(0, 0, 0, 0);
+  var endDay = new Date(maxTs);
+  endDay.setUTCHours(0, 0, 0, 0);
+  for (var dayMs = startDay.getTime(); dayMs <= endDay.getTime(); dayMs += 86400000) {
+    var dayKeyFilled = new Date(dayMs).toISOString().slice(0, 10);
+    var bucket = dayBuckets[dayKeyFilled] || { Valid: 0, Suspicious: 0, Bot: 0 };
     timeline.push({
-      hour: label,
-      Valid: (hourBuckets[hr]?.Valid || 0) + (hourBuckets[hr + 1]?.Valid || 0),
-      Suspicious: (hourBuckets[hr]?.Suspicious || 0) + (hourBuckets[hr + 1]?.Suspicious || 0),
-      Bot: (hourBuckets[hr]?.Bot || 0) + (hourBuckets[hr + 1]?.Bot || 0),
+      hour: dayKeyFilled,
+      Valid: bucket.Valid || 0,
+      Suspicious: bucket.Suspicious || 0,
+      Bot: bucket.Bot || 0,
     });
   }
 
@@ -282,6 +311,7 @@ function runRemediation(sessions, config) {
     pricingTier: activeTier,
     annualGrossSaved: annualGrossSaved,
     annualNetSaved: annualNetSaved,
+    dataSpanDays: dataSpanDays,
     botClicks: botClicks,
     formsBlocked: formsBlocked,
     cpc: cpc,
@@ -738,13 +768,16 @@ export default function App() {
   // Controls which view (Pipeline, Config, Dashboard, Email) is currently active.
   var [view, setView] = useState("pipeline");
   var [dashTab, setDashTab] = useState("overview");
-  var [savingsWindow, setSavingsWindow] = useState("annual");
+  var [savingsWindow, setSavingsWindow] = useState("weekly");
   var [filter, setFilter] = useState("all");
   var [selectedSession, setSelectedSession] = useState(null);
   var [auditTrail, setAuditTrail] = useState([]);
   var [auditFrom, setAuditFrom] = useState("");
   var [auditTo, setAuditTo] = useState("");
+  var [nextAutoRunAt, setNextAutoRunAt] = useState(null);
+  var [nowMs, setNowMs] = useState(Date.now());
   var runStartedAtRef = useRef(null);
+  var pipelineStateRef = useRef("idle");
 
   useEffect(function() {
     try {
@@ -755,6 +788,10 @@ export default function App() {
       }
     } catch (e) {}
   }, []);
+
+  useEffect(function() {
+    pipelineStateRef.current = pipelineState;
+  }, [pipelineState]);
 
   /**
    * addLog: Helper to push a new message to the real-time pipeline log.
@@ -773,6 +810,126 @@ export default function App() {
       blocked_entries: stats.blockedIPs,
     };
     downloadTextFile("blocked_ips.json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportBlockedIpsCsv() {
+    if (!stats || !stats.blockedIPs || stats.blockedIPs.length === 0) return;
+    var header = ["ip", "country", "sessions", "clicks", "saved", "flags"].join(",");
+    var body = stats.blockedIPs.map(function(item) {
+      return [
+        item.ip,
+        item.country || "",
+        item.sessions || 0,
+        item.clicks || 0,
+        item.saved || 0,
+        "\"" + (item.flags || []).join("|") + "\"",
+      ].join(",");
+    }).join("\n");
+    downloadTextFile("blocked_ips.csv", header + "\n" + body, "text/csv;charset=utf-8");
+  }
+
+  function exportSessionsJson() {
+    if (!sessions || sessions.length === 0) return;
+    var payload = {
+      generated_at: new Date().toISOString(),
+      source: config.dataUrl,
+      total_sessions: sessions.length,
+      sessions: sessions.map(function(s) {
+        return {
+          session_id: s.session_id,
+          timestamp: s.timestamp_raw || s.timestamp,
+          ip_address: s.ip_address,
+          user_agent: s.user_agent,
+          page_url: s.page_url,
+          country: s.country,
+          device_type: s.device_type,
+          clicks: s.clicks,
+          form_submitted: s.form_submitted,
+          flags: s.flags || [],
+          risk_score: Number(s.risk_score || 0),
+          verdict: s.verdict || "Valid",
+        };
+      }),
+    };
+    downloadTextFile("processed_sessions.json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+  }
+
+  function formatReportMetricValue(key, value) {
+    if (key === "total_money_saved") {
+      return "$" + Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    return String(value);
+  }
+
+  function getStandardReportPayload() {
+    if (!stats) return null;
+    var reportFields = (config.reportBuilder && config.reportBuilder.fields) || {};
+    var allMetrics = [
+      { key: "total_traffic_analyzed", label: "Total Traffic Analyzed", value: stats.total },
+      { key: "total_money_saved", label: "Total Money Saved", value: scaledNetSaved },
+      { key: "total_blocked_ips", label: "Total Blocked IPs", value: stats.blockedCount },
+      { key: "conversion_protection", label: "Conversion Protection (fake forms blocked)", value: stats.formsBlocked },
+    ];
+    var selectedMetrics = allMetrics.filter(function(metric) {
+      return reportFields[metric.key] !== false;
+    });
+    var keyMetrics = {};
+    selectedMetrics.forEach(function(metric) {
+      keyMetrics[metric.key] = metric.value;
+    });
+    return {
+      generated_at: new Date().toISOString(),
+      source: config.dataUrl,
+      timeframe: String(windowLabels[savingsWindow] || "Weekly") + (isProjectedWindow ? " (Projected)" : ""),
+      key_metrics: keyMetrics,
+      key_metric_rows: selectedMetrics,
+    };
+  }
+
+  function exportStandardReportJson() {
+    var payload = getStandardReportPayload();
+    if (!payload) return;
+    downloadTextFile("standardized_threat_report.json", JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportStandardReportCsv() {
+    var payload = getStandardReportPayload();
+    if (!payload) return;
+    var metricKeys = (payload.key_metric_rows || []).map(function(metric) { return metric.key; });
+    var header = ["generated_at", "source", "timeframe"].concat(metricKeys).join(",");
+    var row = [
+      payload.generated_at,
+      payload.source,
+      payload.timeframe,
+    ].concat(metricKeys.map(function(key) { return payload.key_metrics[key]; })).join(",");
+    downloadTextFile("standardized_threat_report.csv", header + "\n" + row, "text/csv;charset=utf-8");
+  }
+
+  function exportStandardReportPdf() {
+    var payload = getStandardReportPayload();
+    if (!payload) return;
+    var metricRowsHtml = (payload.key_metric_rows || []).map(function(metric) {
+      return "<tr><td>" + metric.label + "</td><td>" + formatReportMetricValue(metric.key, metric.value) + "</td></tr>";
+    }).join("");
+    var html = ""
+      + "<html><head><title>Standardized Threat Report</title><style>"
+      + "body{font-family:Arial,sans-serif;padding:24px;color:#0f172a;}h1{margin:0 0 8px;font-size:22px;}h2{margin:22px 0 8px;font-size:14px;color:#334155;}table{width:100%;border-collapse:collapse;}th,td{border:1px solid #cbd5e1;padding:8px 10px;text-align:left;font-size:12px;}th{background:#f8fafc;} .meta{font-size:12px;color:#475569;line-height:1.7;}"
+      + "</style></head><body>"
+      + "<h1>Standardized Threat Report</h1>"
+      + "<div class='meta'>Generated: " + payload.generated_at + "<br/>Source: " + payload.source + "<br/>Timeframe: " + payload.timeframe + "</div>"
+      + "<h2>Key Metrics</h2>"
+      + "<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>"
+      + metricRowsHtml
+      + "</tbody></table>"
+      + "<p style='margin-top:16px;font-size:11px;color:#64748b;'>Use Print -> Save as PDF to download.</p>"
+      + "</body></html>";
+    var w = window.open("", "_blank");
+    if (!w) return;
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+    w.print();
   }
 
   function exportAuditCsv() {
@@ -832,7 +989,12 @@ export default function App() {
     setPipelineState("running");
     setLogs([]);
     setStageIdx(0);
-    addLog("Pipeline config: " + config.blockedCountries.length + " geofenced countries, " + config.botUserAgents.length + " bot UA patterns, $" + config.cpc + " CPC", "info");
+    addLog(
+      "Pipeline config: " + config.blockedCountries.length + " geofenced countries, "
+      + config.botUserAgents.length + " bot UA patterns, $" + config.cpc + " CPC, max "
+      + (Math.max(1, Math.floor(Number(config.sessionLimit) || 500))) + " sessions",
+      "info"
+    );
     addLog("Fetching from " + config.dataUrl, "info");
 
     // Stage 0: FETCH
@@ -851,8 +1013,14 @@ export default function App() {
         // Stage 1: PARSE - structured data creation
         setStageIdx(1);
         addLog("Parsing CSV \u2014 converting types...", "info");
-        var parsed = parseCSV(csvText);
-        addLog("Parsed " + parsed.length + " sessions", "success");
+        var parsedAll = parseCSV(csvText);
+        var maxSessions = Math.max(1, Math.floor(Number(config.sessionLimit) || 500));
+        var parsed = parsedAll.slice(0, maxSessions);
+        if (parsedAll.length > maxSessions) {
+          addLog("Parsed " + parsed.length + " sessions (limited from " + parsedAll.length + ")", "success");
+        } else {
+          addLog("Parsed " + parsed.length + " sessions", "success");
+        }
 
         // Stage 2: DETECT - risk evaluation
         setTimeout(function() {
@@ -949,6 +1117,33 @@ export default function App() {
       });
   }, [config]);
 
+  useEffect(function() {
+    var autoRunCfg = config.autoRun || { enabled: false, intervalMs: 3600000 };
+    if (!autoRunCfg.enabled) {
+      setNextAutoRunAt(null);
+      return;
+    }
+    var intervalMs = Math.max(1000, Math.floor(Number(autoRunCfg.intervalMs) || 3600000));
+    setNowMs(Date.now());
+    setNextAutoRunAt(Date.now() + intervalMs);
+    var timer = setInterval(function() {
+      if (pipelineStateRef.current !== "running") {
+        runPipeline();
+      }
+      setNextAutoRunAt(Date.now() + intervalMs);
+    }, intervalMs);
+    return function() { clearInterval(timer); };
+  }, [config.autoRun, runPipeline]);
+
+  useEffect(function() {
+    var autoRunCfg = config.autoRun || { enabled: false };
+    if (!autoRunCfg.enabled) return;
+    var clock = setInterval(function() {
+      setNowMs(Date.now());
+    }, 1000);
+    return function() { clearInterval(clock); };
+  }, [config.autoRun]);
+
   // filteredSessions: Memoized list of sessions based on the UI filter (All/Bot/Suspicious/Valid)
   var filteredSessions = useMemo(function() {
     if (!sessions) return [];
@@ -967,16 +1162,31 @@ export default function App() {
   var windowMultipliers = { daily: 1, weekly: 7, monthly: 30, annual: 365 };
   var windowLabels = { daily: "Daily", weekly: "Weekly", monthly: "Monthly", annual: "Annual" };
   var selectedMultiplier = windowMultipliers[savingsWindow] || 365;
-  var scaledNetSaved = stats ? Math.round((stats.saved || 0) * selectedMultiplier * 100) / 100 : 0;
-  var scaledGrossSaved = stats ? Math.round((stats.grossSaved || 0) * selectedMultiplier * 100) / 100 : 0;
-  var scaledSubscription = stats ? Math.round((stats.subscriptionDaily || 0) * selectedMultiplier * 100) / 100 : 0;
-  var moneySavedTooltip = stats
-    ? windowLabels[savingsWindow] + " net saved = gross saved - subscription cost\n"
-      + "Gross: $" + scaledGrossSaved.toLocaleString()
-      + " | Tier: " + String(stats.pricingTier || "smb").toUpperCase()
-      + " | " + windowLabels[savingsWindow] + " sub: $" + scaledSubscription.toLocaleString()
-      + "\nNet: $" + scaledNetSaved.toLocaleString()
-    : "";
+  var dataSpanDays = stats ? Math.max(1, Number(stats.dataSpanDays) || 7) : 1;
+  var isProjectedWindow = selectedMultiplier > dataSpanDays;
+  var projectionAffix = isProjectedWindow ? " (Projected)" : "";
+  var dailyGrossAvg = stats ? (Number(stats.grossSaved) || 0) / dataSpanDays : 0;
+  var dailySubscription = stats ? (Number(stats.subscriptionDaily) || 0) : 0;
+  var scaledGrossSaved = Math.round(dailyGrossAvg * selectedMultiplier * 100) / 100;
+  var scaledSubscription = Math.round(dailySubscription * selectedMultiplier * 100) / 100;
+  var scaledNetRaw = Math.round((scaledGrossSaved - scaledSubscription) * 100) / 100;
+  var dailyNetRaw = Math.round((dailyGrossAvg - dailySubscription) * 100) / 100;
+  var scaledNetSaved = Math.max(0, scaledNetRaw);
+  var dailyNetSaved = Math.max(0, dailyNetRaw);
+  var scaledOpportunityCost = -Math.abs(scaledGrossSaved);
+  var moneyFmt = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+  var autoRunEnabled = !!(config.autoRun && config.autoRun.enabled);
+  var autoRunRemainingMs = autoRunEnabled && nextAutoRunAt ? Math.max(0, nextAutoRunAt - nowMs) : 0;
+  var autoRunCountdownLabel = autoRunEnabled && nextAutoRunAt ? formatCountdown(autoRunRemainingMs) : "";
+
+  function formatCountdown(ms) {
+    var totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    var hours = Math.floor(totalSeconds / 3600);
+    var minutes = Math.floor((totalSeconds % 3600) / 60);
+    var seconds = totalSeconds % 60;
+    if (hours > 0) return hours + "h " + String(minutes).padStart(2, "0") + "m " + String(seconds).padStart(2, "0") + "s";
+    return minutes + "m " + String(seconds).padStart(2, "0") + "s";
+  }
 
   return (
     <div>
@@ -1061,7 +1271,7 @@ export default function App() {
                     { l: "Sessions", v: stats.total, c: "#6366f1" },
                     { l: "Threats", v: stats.bot, c: "#ef4444" },
                     { l: "IPs Blocked", v: stats.blockedCount, c: "#f97316" },
-                    { l: "Money Saved", v: stats.saved, p: "$", c: "#10b981", tip: moneySavedTooltip },
+                    { l: "Opportunity Cost", v: -Math.abs(stats.saved || 0), p: "$", c: "#ef4444", tip: "Potential loss from invalid traffic for this run." },
                   ].map(function(item, i) {
                     return (
                       <div key={item.l} title={item.tip || ""} style={{ background: item.c + "08", borderRadius: 14, padding: "20px 18px", border: "1px solid " + item.c + "18", textAlign: "center" }}>
@@ -1281,6 +1491,125 @@ export default function App() {
                         border: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.03)",
                         color: "#e2e8f0", fontSize: 12, fontFamily: "monospace", outline: "none",
                       }} />
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>Sessions to parse</div>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={config.sessionLimit}
+                        onChange={function(e) {
+                          var val = Math.max(1, Math.floor(Number(e.target.value) || 1));
+                          setConfig(function(prev) {
+                            var next = JSON.parse(JSON.stringify(prev));
+                            next.sessionLimit = val;
+                            return next;
+                          });
+                        }}
+                        style={{ width: "100%", padding: "7px 10px", borderRadius: 8, border: "1px solid rgba(255,255,255,.08)", background: "rgba(255,255,255,.03)", color: "#e2e8f0", fontSize: 12, outline: "none" }}
+                      />
+                      <div style={{ fontSize: 10, color: "#475569", marginTop: 4 }}>Default is 500 sessions per run.</div>
+                    </div>
+                  </div>
+
+                  {/* Automated Run */}
+                  <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 24px", border: "1px solid rgba(255,255,255,.04)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>Automated Run</div>
+                      <button
+                        onClick={function() {
+                          setConfig(function(prev) {
+                            var next = JSON.parse(JSON.stringify(prev));
+                            if (!next.autoRun) next.autoRun = { enabled: false, intervalMs: 3600000 };
+                            next.autoRun.enabled = !next.autoRun.enabled;
+                            return next;
+                          });
+                        }}
+                        style={{
+                          padding: "6px 12px",
+                          borderRadius: 8,
+                          border: "none",
+                          cursor: "pointer",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          background: (config.autoRun && config.autoRun.enabled) ? "rgba(16,185,129,.2)" : "rgba(255,255,255,.05)",
+                          color: (config.autoRun && config.autoRun.enabled) ? "#6ee7b7" : "#94a3b8",
+                        }}
+                      >
+                        {(config.autoRun && config.autoRun.enabled) ? "TRUE" : "FALSE"}
+                      </button>
+                    </div>
+                    <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>Run interval (ms)</div>
+                    <input
+                      type="number"
+                      min={1000}
+                      step={1000}
+                      value={(config.autoRun && config.autoRun.intervalMs) || 3600000}
+                      disabled={!(config.autoRun && config.autoRun.enabled)}
+                      onChange={function(e) {
+                        var val = Math.max(1000, Math.floor(Number(e.target.value) || 3600000));
+                        setConfig(function(prev) {
+                          var next = JSON.parse(JSON.stringify(prev));
+                          if (!next.autoRun) next.autoRun = { enabled: false, intervalMs: 3600000 };
+                          next.autoRun.intervalMs = val;
+                          return next;
+                        });
+                      }}
+                      style={{
+                        width: "100%",
+                        padding: "7px 10px",
+                        borderRadius: 8,
+                        border: "1px solid rgba(255,255,255,.08)",
+                        background: (config.autoRun && config.autoRun.enabled) ? "rgba(255,255,255,.03)" : "rgba(255,255,255,.015)",
+                        color: (config.autoRun && config.autoRun.enabled) ? "#e2e8f0" : "#64748b",
+                        fontSize: 12,
+                        outline: "none",
+                      }}
+                    />
+                    <div style={{ fontSize: 10, color: "#475569", marginTop: 4 }}>Default: 3,600,000 ms (1 hour). Runs only when TRUE and never overlaps an active run.</div>
+                  </div>
+
+                  {/* Report Builder */}
+                  <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 24px", border: "1px solid rgba(255,255,255,.04)" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Report Builder</div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10 }}>Select which key metrics appear in standardized PDF/CSV/JSON exports.</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      {[
+                        ["total_traffic_analyzed", "Total Traffic Analyzed"],
+                        ["total_money_saved", "Total Money Saved"],
+                        ["total_blocked_ips", "Total Blocked IPs"],
+                        ["conversion_protection", "Conversion Protection"],
+                      ].map(function(field) {
+                        var isEnabled = !(config.reportBuilder && config.reportBuilder.fields && config.reportBuilder.fields[field[0]] === false);
+                        return (
+                          <button
+                            key={field[0]}
+                            onClick={function() {
+                              setConfig(function(prev) {
+                                var next = JSON.parse(JSON.stringify(prev));
+                                if (!next.reportBuilder) next.reportBuilder = { fields: {} };
+                                if (!next.reportBuilder.fields) next.reportBuilder.fields = {};
+                                next.reportBuilder.fields[field[0]] = !isEnabled;
+                                return next;
+                              });
+                            }}
+                            style={{
+                              textAlign: "left",
+                              padding: "8px 10px",
+                              borderRadius: 8,
+                              border: "1px solid rgba(255,255,255,.08)",
+                              background: isEnabled ? "rgba(16,185,129,.12)" : "rgba(255,255,255,.02)",
+                              color: isEnabled ? "#6ee7b7" : "#64748b",
+                              fontSize: 11,
+                              fontWeight: 600,
+                              cursor: "pointer",
+                            }}
+                          >
+                            {(isEnabled ? "✓ " : "○ ") + field[1]}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   {/* Pricing Tiers */}
@@ -1404,6 +1733,12 @@ export default function App() {
                     <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#10b981" }} />
                     <span style={{ fontSize: 11, color: "#10b981", fontWeight: 600 }}>Processed from live data</span>
                   </div>
+                  {autoRunEnabled && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", background: "rgba(99,102,241,.08)", borderRadius: 10, border: "1px solid rgba(99,102,241,.2)" }}>
+                      <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#6366f1" }} />
+                      <span style={{ fontSize: 11, color: "#a5b4fc", fontWeight: 600 }}>Next auto run in {autoRunCountdownLabel}</span>
+                    </div>
+                  )}
                   <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,.03)", borderRadius: 10, padding: 3 }}>
                     {["daily", "weekly", "monthly", "annual"].map(function(w) {
                       var isActive = savingsWindow === w;
@@ -1423,7 +1758,7 @@ export default function App() {
                             letterSpacing: 0.4,
                           }}
                         >
-                          {windowLabels[w]}
+                          {windowLabels[w]}{(w === savingsWindow && isProjectedWindow) ? " (Projected)" : ""}
                         </button>
                       );
                     })}
@@ -1436,19 +1771,54 @@ export default function App() {
                 {[
                   { l: "SESSIONS", v: stats.total, c: "#6366f1", s: "from live endpoint" },
                   {
-                    l: "MONEY SAVED",
-                    v: scaledNetSaved,
+                    l: "OPPORTUNITY COST",
+                    v: scaledOpportunityCost,
                     p: "$",
-                    c: "#10b981",
-                    s: windowLabels[savingsWindow] + " gross $" + scaledGrossSaved.toLocaleString() + " - " + String(stats.pricingTier || "smb").toUpperCase() + " $" + scaledSubscription.toLocaleString(),
-                    tip: moneySavedTooltip,
+                    c: "#ef4444",
+                    s: "Potential loss in this " + String(windowLabels[savingsWindow] || "Annual").toLowerCase() + projectionAffix + " window (normalized from " + dataSpanDays + "-day sample)",
+                    tip: "Shown as a negative number to represent potential loss if not mitigated.",
                   },
-                  { l: "IPS BLOCKED", v: stats.blockedCount, c: "#ef4444", s: "written to blocklist" },
+                  {
+                    l: "IPS BLOCKED",
+                    v: stats.blockedCount,
+                    c: "#ef4444",
+                    s: "written to blocklist",
+                    exports: [
+                      { label: "CSV", onClick: exportBlockedIpsCsv },
+                      { label: "JSON", onClick: exportBlockedIpsJson },
+                    ],
+                  },
                   { l: "FORMS BLOCKED", v: stats.formsBlocked, c: "#f59e0b", s: "conversions protected" },
                 ].map(function(kpi, i) {
                   return (
                     <div key={kpi.l} title={kpi.tip || ""} style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, padding: "22px 20px", border: "1px solid rgba(255,255,255,.04)" }}>
-                      <div style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 }}>{kpi.l}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                        <div style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>{kpi.l}</div>
+                        {kpi.exports && (
+                          <div style={{ display: "flex", gap: 4 }}>
+                            {kpi.exports.map(function(exp) {
+                              return (
+                                <button
+                                  key={exp.label}
+                                  onClick={function(e) { e.stopPropagation(); exp.onClick(); }}
+                                  style={{
+                                    padding: "2px 6px",
+                                    borderRadius: 6,
+                                    border: "1px solid rgba(255,255,255,.08)",
+                                    background: "rgba(255,255,255,.03)",
+                                    color: "#94a3b8",
+                                    fontSize: 9,
+                                    fontWeight: 700,
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  {exp.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
                       <div style={{ fontSize: 34, fontWeight: 800, color: kpi.c, letterSpacing: -2 }}>
                         <AnimNum value={kpi.v} prefix={kpi.p} delay={i * 150} />
                       </div>
@@ -1535,7 +1905,23 @@ export default function App() {
                   <div style={{ background: "rgba(255,255,255,.02)", borderRadius: 16, border: "1px solid rgba(255,255,255,.04)", overflow: "hidden" }}>
                     <div style={{ padding: "14px 22px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                       <div><span style={{ fontSize: 13, fontWeight: 700 }}>Session Log</span><span style={{ fontSize: 11, color: "#334155", marginLeft: 10 }}>{filteredSessions.length} sessions</span></div>
-                      <div style={{ display: "flex", gap: 4 }}>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <button
+                          onClick={exportSessionsJson}
+                          style={{
+                            padding: "5px 10px",
+                            borderRadius: 6,
+                            border: "1px solid rgba(255,255,255,.08)",
+                            cursor: "pointer",
+                            fontSize: 10,
+                            fontWeight: 700,
+                            background: "rgba(255,255,255,.03)",
+                            color: "#94a3b8",
+                            letterSpacing: 0.4,
+                          }}
+                        >
+                          EXPORT JSON
+                        </button>
                         {["all","bot","suspicious","valid"].map(function(fk) {
                           var fc = fk === "bot" ? "#ef4444" : fk === "suspicious" ? "#f59e0b" : fk === "valid" ? "#10b981" : "#94a3b8";
                           return <button key={fk} onClick={function() { setFilter(fk); }} style={{ padding: "5px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 600, background: filter === fk ? fc + "18" : "rgba(255,255,255,.03)", color: filter === fk ? fc : "#475569" }}>{fk.charAt(0).toUpperCase() + fk.slice(1)}</button>;
@@ -1593,12 +1979,42 @@ export default function App() {
               {/* ROI */}
               <div style={{ marginTop: 20, borderRadius: 16, padding: "26px 30px", background: "linear-gradient(135deg,rgba(16,185,129,.06),rgba(6,182,212,.04))", border: "1px solid rgba(16,185,129,.1)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 20 }}>
                 <div>
-                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>{("PROJECTED " + String(windowLabels[savingsWindow] || "Annual").toUpperCase() + " NET SAVINGS")}</div>
+                  <div style={{ fontSize: 9, color: "#475569", letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>{("POTENTIAL SAVINGS (" + String(windowLabels[savingsWindow] || "Annual").toUpperCase() + ")" + (isProjectedWindow ? " (PROJECTED)" : ""))}</div>
                   <div style={{ fontSize: 40, fontWeight: 800, color: "#10b981", letterSpacing: -2.5 }}>
-                    <AnimNum value={Math.round(scaledNetSaved || 0)} prefix="$" delay={300} />
+                    {"$" + scaledNetSaved.toLocaleString(undefined, moneyFmt)}
                   </div>
                   <div style={{ fontSize: 11, color: "#334155", marginTop: 3 }}>
-                    {windowLabels[savingsWindow]} gross ${Math.round(scaledGrossSaved || 0).toLocaleString()} - {String(stats.pricingTier || "smb").toUpperCase()} ${Math.round(scaledSubscription || 0).toLocaleString()}
+                    Net potential savings = max(0, Gross ${scaledGrossSaved.toLocaleString(undefined, moneyFmt)} - Subscription ${scaledSubscription.toLocaleString(undefined, moneyFmt)}) = ${scaledNetSaved.toLocaleString(undefined, moneyFmt)}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#334155", marginTop: 3 }}>
+                    Daily net: max(0, ${dailyGrossAvg.toLocaleString(undefined, moneyFmt)} - ${dailySubscription.toLocaleString(undefined, moneyFmt)}) = ${dailyNetSaved.toLocaleString(undefined, moneyFmt)}/day (based on {dataSpanDays}-day sample)
+                  </div>
+                  <div style={{ marginTop: 12, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {[
+                      { label: "REPORT PDF", onClick: exportStandardReportPdf },
+                      { label: "REPORT CSV", onClick: exportStandardReportCsv },
+                      { label: "REPORT JSON", onClick: exportStandardReportJson },
+                    ].map(function(btn) {
+                      return (
+                        <button
+                          key={btn.label}
+                          onClick={btn.onClick}
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 8,
+                            border: "1px solid rgba(16,185,129,.2)",
+                            background: "rgba(16,185,129,.08)",
+                            color: "#10b981",
+                            fontSize: 10,
+                            fontWeight: 700,
+                            letterSpacing: 0.4,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {btn.label}
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 32 }}>
